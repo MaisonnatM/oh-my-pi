@@ -158,6 +158,7 @@ export {
 export { type SecretEntry, SecretObfuscator } from "./obfuscator";
 export * from "./patterns";
 export { secretEntriesNeedPlaceholderKey, secretEntryNeedsPlaceholderKey } from "./placeholder";
+export * from "./tool-output";
 
 /**
  * Load secrets from project-local and global secrets.yml files.

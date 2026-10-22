@@ -47,6 +47,8 @@ export interface BashExecutorOptions {
 	 * for live previews instead of re-buffering `onChunk` chunks.
 	 */
 	onPreview?: (text: string) => void;
+	/** Protect complete captured text before the sink's lossy display projection. */
+	protectOutput?: (text: string) => string;
 	chunkThrottleMs?: number;
 	signal?: AbortSignal;
 	/** Session key suffix to isolate shell sessions per agent */
@@ -489,6 +491,7 @@ async function executeUserShellPty(run: {
 	signal: AbortSignal | undefined;
 	sink: OutputSink;
 	graphics: TerminalGraphicsDecoder;
+	captureProtected?: (chunk: string) => void;
 	dump: (notice?: string) => Promise<OutputSummary & { images?: ImageContent[] }>;
 }): Promise<BashResult> {
 	const session = new PtySession();
@@ -509,7 +512,11 @@ async function executeUserShellPty(run: {
 			// Preserve raw bytes for the terminal display, but extract graphics
 			// before the transcript sink sanitizes or truncates the clean text.
 			const clean = run.graphics.push(chunk);
-			if (clean) run.sink.push(clean.replace(/\r\n?/gu, "\n"));
+			if (clean) {
+				const text = clean.replace(/\r\n?/gu, "\n");
+				run.captureProtected?.(text);
+				run.sink.push(text);
+			}
 		},
 	);
 	if (result.timedOut) {
@@ -617,20 +624,55 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	let acceptingChunks = true;
 	let graphicsFinished = false;
 	let decodedImages: ImageContent[] = [];
+	let protectedChunks: string[] = [];
+	let protectedBytes = 0;
+	let protectedOverflow = false;
+	const protectedLimit = resolveOutputSinkArtifactMaxBytes(settings) || 8 * 1024 * 1024;
+	const captureProtected = (chunk: string): void => {
+		if (!options?.protectOutput || protectedOverflow) return;
+		protectedBytes += Buffer.byteLength(chunk);
+		if (protectedBytes > protectedLimit) {
+			protectedChunks = [];
+			protectedOverflow = true;
+		} else {
+			protectedChunks.push(chunk);
+		}
+	};
 	const enqueueChunk = (chunk: string) => {
 		if (!acceptingChunks) return;
 		const clean = graphics.push(chunk);
-		if (clean) sink.push(clean);
+		if (clean) {
+			captureProtected(clean);
+			sink.push(clean);
+		}
 	};
 	const dump = async (notice?: string): Promise<OutputSummary & { images?: ImageContent[] }> => {
 		if (!graphicsFinished) {
 			graphicsFinished = true;
 			const tail = graphics.finish();
-			if (tail) sink.push(tail);
+			if (tail) {
+				captureProtected(tail);
+				sink.push(tail);
+			}
 			decodedImages = await graphics.images();
 		}
+		let summary = await sink.dump(notice);
+		if (options?.protectOutput) {
+			const safeSink = new OutputSink({
+				headBytes: resolveOutputSinkHeadBytes(settings),
+				maxColumns: resolveOutputMaxColumns(settings),
+			});
+			safeSink.push(
+				protectedOverflow
+					? "[Output exceeded complete credential-inspection capture; preview omitted. Read the raw artifact for protected source ranges.]"
+					: options.protectOutput(protectedChunks.join("")),
+			);
+			const safe = await safeSink.dump(notice);
+			summary = { ...summary, output: safe.output };
+			protectedChunks = [];
+		}
 		return {
-			...(await sink.dump(notice)),
+			...summary,
 			...(decodedImages.length > 0 ? { images: decodedImages } : {}),
 		};
 	};
@@ -657,6 +699,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				signal: options?.signal,
 				sink,
 				graphics,
+				captureProtected,
 				dump,
 			});
 		} finally {

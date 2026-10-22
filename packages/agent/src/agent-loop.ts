@@ -1558,7 +1558,13 @@ async function runLoopBody(
 					const toolResults: ToolResultMessage[] = [];
 					for (const toolCall of toolCalls) {
 						const errorMessage = toolCallAbortMessages?.[toolCall.id] ?? message.errorMessage;
-						const result = createAbortedToolResult(toolCall, stream, message.stopReason, errorMessage);
+						const result = createAbortedToolResult(
+							toolCall,
+							stream,
+							message.stopReason,
+							errorMessage,
+							config.toolOutputBoundary,
+						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
 						toolResults.push(result);
@@ -1645,6 +1651,7 @@ async function runLoopBody(
 							stream,
 							"skipped",
 							`Not executed: call the \`${softRequiredTool}\` tool to resolve the pending action before using other tools.`,
+							config.toolOutputBoundary,
 						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
@@ -1693,7 +1700,13 @@ async function runLoopBody(
 					const skipReason = deadlinePassed ? "aborted" : message.stopReason === "length" ? "length" : "skipped";
 					const skipErrMsg = deadlinePassed ? "Deadline exceeded" : undefined;
 					for (const toolCall of toolCalls) {
-						const result = createAbortedToolResult(toolCall, stream, skipReason, skipErrMsg);
+						const result = createAbortedToolResult(
+							toolCall,
+							stream,
+							skipReason,
+							skipErrMsg,
+							config.toolOutputBoundary,
+						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
 						toolResults.push(result);
@@ -2377,13 +2390,15 @@ async function streamAssistantResponse(
 										toolCallId: block.id,
 										toolName: block.name,
 										customWireName: block.customWireName,
-										emit: update =>
+										emit: update => {
+											if (config.toolOutputBoundary?.enabled) return;
 											stream.push({
 												type: "tool_stream_update",
 												toolCallId: block.id,
 												toolName: block.name,
 												update,
-											}),
+											});
+										},
 									});
 									if (argStream) argStreams.set(event.contentIndex, { id: block.id, stream: argStream });
 								} catch (error) {
@@ -3453,14 +3468,15 @@ async function executeToolCalls(
 
 	const emitToolResult = (record: (typeof records)[number], result: AgentToolResult<any>, isError: boolean): void => {
 		if (record.resultEmitted) return;
+		result = config.toolOutputBoundary?.result(result) ?? result;
 		const { toolCall } = record;
 		if (!record.started) {
 			stream.push({
 				type: "tool_execution_start",
 				toolCallId: toolCall.id,
 				toolName: toolCall.name,
-				args: record.args,
-				intent: toolCall.intent,
+				args: config.toolOutputBoundary?.arguments(record.args) ?? record.args,
+				intent: toolCall.intent && (config.toolOutputBoundary?.text(toolCall.intent) ?? toolCall.intent),
 			});
 		}
 		stream.push({
@@ -3546,8 +3562,8 @@ async function executeToolCalls(
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
-			args: effectiveArgs,
-			intent: toolCall.intent,
+			args: config.toolOutputBoundary?.arguments(effectiveArgs) ?? effectiveArgs,
+			intent: toolCall.intent && (config.toolOutputBoundary?.text(toolCall.intent) ?? toolCall.intent),
 		});
 
 		const toolSpan = startExecuteToolSpan(telemetry, {
@@ -3618,9 +3634,11 @@ async function executeToolCalls(
 						steeringSignal: steeringSoftController.signal,
 						providerMetadata: toolCall.providerMetadata,
 						addAdditionalContext: context => {
-							if (isNonBlankContext(context)) record.reportedContext.push(context);
+							if (isNonBlankContext(context))
+								record.reportedContext.push(config.toolOutputBoundary?.text(context) ?? context);
 						},
 					});
+					if (toolContext && config.toolOutputBoundary) toolContext.toolOutputBoundary = config.toolOutputBoundary;
 					const streamSession = speculationCoordinator?.takeStreamSession(toolCall.id);
 					if (streamSession && toolContext) {
 						toolContext[SPECULATIVE_STREAM_SESSION] = streamSession;
@@ -3635,6 +3653,7 @@ async function executeToolCalls(
 							executionArgs,
 							record.signal,
 							partialResult => {
+								if (config.toolOutputBoundary?.enabled) return;
 								const event: Extract<AgentEvent, { type: "tool_execution_update" }> = {
 									type: "tool_execution_update",
 									toolCallId: toolCall.id,
@@ -3692,7 +3711,9 @@ async function executeToolCalls(
 						result = coerced.result;
 						isError = coerced.malformed || (after.isError ?? isError);
 						if (isNonBlankContext(after.additionalContext)) {
-							record.reportedContext.push(after.additionalContext);
+							record.reportedContext.push(
+								config.toolOutputBoundary?.text(after.additionalContext) ?? after.additionalContext,
+							);
 						}
 					}
 				} catch (e) {
@@ -3723,9 +3744,9 @@ async function executeToolCalls(
 			emitToolResult(record, result, isError);
 		}
 
+		result = record.result ?? result;
 		const firstTextBlock = result.content?.[0];
-		const errorMessageForSpan =
-			caughtError === undefined && isError && firstTextBlock?.type === "text" ? firstTextBlock.text : undefined;
+		const errorMessageForSpan = isError && firstTextBlock?.type === "text" ? firstTextBlock.text : undefined;
 		const status = abortedDuringExecution
 			? "aborted"
 			: caughtError instanceof ToolCallBlockedError
@@ -3738,7 +3759,7 @@ async function executeToolCalls(
 			isError,
 			status,
 			errorMessage: errorMessageForSpan,
-			errorObject: caughtError,
+			errorObject: config.toolOutputBoundary?.enabled ? undefined : caughtError,
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
 		});
@@ -3895,7 +3916,9 @@ async function executeToolCalls(
 	);
 	return {
 		toolResults: emittedToolResults,
-		...(additionalContext !== undefined ? { additionalContext } : {}),
+		...(additionalContext !== undefined
+			? { additionalContext: config.toolOutputBoundary?.text(additionalContext) ?? additionalContext }
+			: {}),
 	};
 }
 
@@ -4015,8 +4038,11 @@ function createAbortedToolResult(
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	reason: "aborted" | "error" | "skipped" | "length",
 	errorMessage?: string,
+	boundary?: AgentLoopConfig["toolOutputBoundary"],
 ): ToolResultMessage {
-	const toolResultMessage = createSyntheticToolResultMessage(toolCall, reason, errorMessage);
+	const rawMessage = createSyntheticToolResultMessage(toolCall, reason, errorMessage);
+	const safeResult = boundary?.result({ content: rawMessage.content, details: rawMessage.details });
+	const toolResultMessage = safeResult ? { ...rawMessage, ...safeResult } : rawMessage;
 	const result: AgentToolResult<SyntheticToolResultDetails> = {
 		content: toolResultMessage.content,
 		details: toolResultMessage.details,
@@ -4026,8 +4052,8 @@ function createAbortedToolResult(
 		type: "tool_execution_start",
 		toolCallId: toolCall.id,
 		toolName: toolCall.name,
-		args: toolCall.arguments,
-		intent: toolCall.intent,
+		args: boundary?.arguments(toolCall.arguments) ?? toolCall.arguments,
+		intent: toolCall.intent && (boundary?.text(toolCall.intent) ?? toolCall.intent),
 	});
 	stream.push({
 		type: "tool_execution_end",

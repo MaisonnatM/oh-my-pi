@@ -53,6 +53,7 @@ import type {
 	AgentContext,
 	AgentEvent,
 	AgentLoopConfig,
+	ToolOutputBoundary,
 	AgentMessage,
 	AgentState,
 	AgentTool,
@@ -254,6 +255,7 @@ export interface AgentOptions {
 	 * Use for deobfuscating secrets or rewriting arguments.
 	 */
 	transformToolCallArguments?: (args: Record<string, unknown>, toolName: string) => Record<string, unknown>;
+	toolOutputBoundary?: ToolOutputBoundary;
 	/** Host authorization and telemetry for opt-in speculative tool execution. */
 	speculativeToolExecution?: SpeculativeToolExecutionConfig;
 
@@ -477,6 +479,7 @@ export class Agent {
 	#kimiApiFormat?: "openai" | "anthropic";
 	#preferWebsockets?: boolean;
 	#transformToolCallArguments?: (args: Record<string, unknown>, toolName: string) => Record<string, unknown>;
+	readonly toolOutputBoundary?: ToolOutputBoundary;
 	#speculativeToolExecution?: SpeculativeToolExecutionConfig;
 	#resolveFallbackTool?: (name: string, advertised: readonly AgentTool<any>[]) => AgentTool<any> | undefined;
 	#suggestFallbackToolNames?: () => Iterable<string>;
@@ -585,6 +588,7 @@ export class Agent {
 		this.#kimiApiFormat = opts.kimiApiFormat;
 		this.#preferWebsockets = opts.preferWebsockets;
 		this.#transformToolCallArguments = opts.transformToolCallArguments;
+		this.toolOutputBoundary = opts.toolOutputBoundary;
 		this.#speculativeToolExecution = opts.speculativeToolExecution;
 		this.#resolveFallbackTool = opts.resolveFallbackTool;
 		this.#suggestFallbackToolNames = opts.suggestFallbackToolNames;
@@ -1209,6 +1213,25 @@ export class Agent {
 	}
 
 	emitExternalEvent(event: AgentEvent) {
+		const boundary = this.toolOutputBoundary;
+		if (boundary?.enabled) {
+			if (event.type === "tool_execution_update" || event.type === "tool_stream_update") return;
+			if (event.type === "message_update" && event.message.role === "toolResult") return;
+			if (event.type === "tool_execution_start") {
+				event = {
+					...event,
+					args: boundary.arguments(event.args),
+					intent: event.intent && boundary.text(event.intent),
+				};
+			} else if (event.type === "tool_execution_end") {
+				event = { ...event, result: boundary.result(event.result) };
+			} else if (
+				(event.type === "message_start" || event.type === "message_end") &&
+				event.message.role === "toolResult"
+			) {
+				event = { ...event, message: { ...event.message, ...boundary.result(event.message) } };
+			}
+		}
 		switch (event.type) {
 			case "message_start":
 			case "message_update":
@@ -1827,7 +1850,7 @@ export class Agent {
 			// result replaces the first rather than pairing a second result with
 			// the same id (issue #15749).
 			const entry: CursorToolResultEntry = {
-				toolResult: message,
+				toolResult: this.toolOutputBoundary ? { ...message, ...this.toolOutputBoundary.result(message) } : message,
 				additionalContext: (message as ToolResultWithAdditionalContext)[TOOL_RESULT_ADDITIONAL_CONTEXT],
 			};
 			const superseded = this.#cursorToolResultBuffer.findIndex(
@@ -1840,7 +1863,10 @@ export class Agent {
 				const pending = (async () => {
 					try {
 						const updated = await transform(message);
-						if (updated) entry.toolResult = updated;
+						if (updated)
+							entry.toolResult = this.toolOutputBoundary
+								? { ...updated, ...this.toolOutputBoundary.result(updated) }
+								: updated;
 					} catch {}
 				})();
 				entry.pending = pending;
@@ -1934,6 +1960,7 @@ export class Agent {
 			cwd: this.#cwd,
 			getCwd: this.#cwdResolver,
 			transformToolCallArguments: this.#transformToolCallArguments,
+			toolOutputBoundary: this.toolOutputBoundary,
 			speculativeToolExecution: this.#speculativeToolExecution,
 			resolveFallbackTool: this.#resolveFallbackTool,
 			suggestFallbackToolNames: this.#suggestFallbackToolNames,
@@ -2158,13 +2185,16 @@ export class Agent {
 				for (const block of errorMsg.content) {
 					if (block.type !== "toolCall") continue;
 					if (bufferedCursorToolCallIds.has(block.id)) continue;
-					const toolResult = createSyntheticToolResultMessage(block, "error", errorMessage);
+					const rawResult = createSyntheticToolResultMessage(block, "error", errorMessage);
+					const toolResult = this.toolOutputBoundary
+						? { ...rawResult, ...this.toolOutputBoundary.result(rawResult) }
+						: rawResult;
 					this.#emit({
 						type: "tool_execution_start",
 						toolCallId: block.id,
 						toolName: block.name,
-						args: block.arguments,
-						intent: block.intent,
+						args: this.toolOutputBoundary?.arguments(block.arguments) ?? block.arguments,
+						intent: block.intent && (this.toolOutputBoundary?.text(block.intent) ?? block.intent),
 					});
 					this.#emit({
 						type: "tool_execution_end",
@@ -2281,7 +2311,7 @@ export class Agent {
 	 * provider request instead of the current one.
 	 */
 	#emitCursorAdditionalContext(text: string): AgentMessage {
-		const message = createAdditionalContextMessage(text);
+		const message = createAdditionalContextMessage(this.toolOutputBoundary?.text(text) ?? text);
 		this.#emit({ type: "message_start", message });
 		this.appendMessage(message);
 		this.#emit({ type: "message_end", message });

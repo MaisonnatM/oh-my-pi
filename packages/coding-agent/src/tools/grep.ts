@@ -28,6 +28,7 @@ import { materializeReadUrlToFile, parseReadUrlTarget } from "./fetch";
 import { createFileRecorder, formatResultPath, resultSnapshotPath } from "./file-recorder";
 import { type FileMatchSection, formatFileMatches } from "@oh-my-pi/pi-tui/tools/grouped-file-output";
 import { formatMatchLine } from "@oh-my-pi/pi-tui/tools/match-line-format";
+import { protectGrepMatches } from "./grep-protection";
 import { isFindEnabled } from "./jfind";
 import {
 	expandDelimitedPathEntries,
@@ -1022,10 +1023,23 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 						if (tag) hashContexts.set(editable[index].relativePath, { tag, path: editable[index].snapshotPath });
 					}
 				}
+				const boundary = this.session.toolOutputBoundary;
+				const omittedLinesByFile = boundary?.enabled
+					? await protectGrepMatches({
+							boundary,
+							matchesByFile,
+							hashContexts,
+							archiveDisplayMap,
+							searchPath,
+							filesystem: urlFilesystem,
+							editStore: getEditStore(this.session),
+							maxSourceBytes: NATIVE_GREP_MAX_FILE_BYTES,
+						})
+					: new Map<string, Set<number>>();
 				const renderMatchesForFile = (relativePath: string): FileMatchSection => {
 					const modelOut: string[] = [];
 					const displayOut: string[] = [];
-					let cutLines: Set<number> | undefined;
+					let cutLines = omittedLinesByFile.get(relativePath);
 					const fileMatches = matchesByFile.get(relativePath) ?? [];
 					const hashContext = hashContexts.get(relativePath);
 					const useHashLines = hashContext !== undefined;
@@ -1092,7 +1106,9 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					outputLines.push("", warningNote);
 				}
 				const rawOutput = outputLines.join("\n");
-				const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
+				const truncation = truncateHead(this.session.toolOutputBoundary?.text(rawOutput) ?? rawOutput, {
+					maxLines: Number.MAX_SAFE_INTEGER,
+				});
 				const output = truncation.content;
 				const displayText = displayLines.join("\n");
 				let displayTargets: Record<string, string> | undefined;

@@ -3,6 +3,7 @@ import {
 	buildKeyedReplacementRun,
 	buildPlaceholder,
 	defaultPlaceholderKey,
+	GENERATED_PLACEHOLDER_RE,
 	inferCaseHint,
 	labelCollidesWithAnySecret,
 	lookupFriendlyPlaceholderAlias,
@@ -535,6 +536,9 @@ export class SecretObfuscator {
 	/** Obfuscate all secrets in text. Bidirectional placeholders for obfuscate mode, one-way for replace. */
 	obfuscate(text: string, sharedRegexSecretValues?: ReadonlySet<string>): string {
 		if (!this.obfuscates()) return text;
+		if (text.length < MIN_OBFUSCATE_SECRET_LEN && this.#findObfuscateIndex(text) !== undefined) {
+			return this.#placeholderForRegexChunk(text, "ToolCredential");
+		}
 		const sharedValues = sharedRegexSecretValues ?? EMPTY_SECRET_VALUES;
 		const { values: currentValues, literalFree } = this.#collectStandalone(text);
 		// Clean (no regex value, no literal, no placeholder candidate) text came
@@ -848,6 +852,30 @@ export class SecretObfuscator {
 		({ text: result, origin } = this.#stabilizeReplaceRegexPlaceholderSpillover(result, origin));
 
 		return result;
+	}
+
+	/** Mint a context-confirmed credential without globally matching short ordinary text. */
+	obfuscateCredentialValue(value: string): string {
+		if (!value || !this.#obfuscating) return value;
+		this.#hasAny = true;
+		const placeholder = this.#placeholderForRegexChunk(value, "ToolCredential");
+		if (value.length >= MIN_OBFUSCATE_SECRET_LEN) {
+			this.#plainMappings.set(value, this.#findObfuscateIndex(value)!);
+		}
+		return placeholder;
+	}
+
+	/** Execution must not silently write an unresolved masking artifact into source. */
+	deobfuscateToolText(text: string): string {
+		GENERATED_PLACEHOLDER_RE.lastIndex = 0;
+		for (const match of text.matchAll(GENERATED_PLACEHOLDER_RE)) {
+			if (this.#lookupLiveAlias(match[0]) === undefined) {
+				throw new Error(
+					"Credential placeholder cannot be restored. Re-read its source in this session before retrying.",
+				);
+			}
+		}
+		return this.deobfuscate(text);
 	}
 
 	/** Deobfuscate keyed placeholders for provider output, tool-call arguments, replay, and display. */

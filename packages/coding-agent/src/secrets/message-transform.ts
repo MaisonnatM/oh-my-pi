@@ -22,8 +22,8 @@ import { SecretValueSet } from "./placeholder";
  * Restore secret placeholders for local display. Only message kinds the model
  * itself authored from obfuscated context carry placeholders — assistant
  * content and the LLM-written branch/compaction summaries. User, developer, and
- * tool-result messages are persisted with their literal text, so operator-authored
- * placeholder-shaped text must survive untouched; those roles are never walked.
+ * tool-result messages are never restored. Protected tool results retain their
+ * masked text on disk and after rebuild; operator-authored placeholders stay untouched.
  */
 export function deobfuscateSessionContext(
 	sessionContext: SessionContext,
@@ -69,9 +69,9 @@ export function deobfuscateAgentMessages(obfuscator: SecretObfuscator, messages:
 }
 
 /**
- * Restore placeholders in assistant content: visible text and tool-call
- * arguments/intent/rawBlock. Thinking and signatures are opaque
- * provider-replay/hidden-reasoning data and pass through byte-identical.
+ * Restore visible assistant text for local display. Tool calls, thinking, and
+ * signatures retain their masked or opaque representation. Tool arguments are
+ * restored separately on private execution inputs.
  */
 export function deobfuscateAssistantContent(
 	obfuscator: SecretObfuscator,
@@ -88,14 +88,6 @@ export function deobfuscateAssistantContent(
 			return { ...block, text };
 		}
 
-		if (block.type === "toolCall") {
-			const args = deobfuscateToolArguments(obfuscator, block.arguments);
-			const intent = block.intent === undefined ? undefined : deob(block.intent);
-			const rawBlock = block.rawBlock === undefined ? undefined : deob(block.rawBlock);
-			if (args === block.arguments && intent === block.intent && rawBlock === block.rawBlock) return block;
-			changed = true;
-			return { ...block, arguments: args, intent, rawBlock };
-		}
 		return block;
 	});
 	return changed ? result : content;
@@ -110,7 +102,7 @@ export function deobfuscateToolArguments(
 	args: Record<string, unknown>,
 ): Record<string, unknown> {
 	if (!obfuscator.hasSecrets()) return args;
-	return mapJsonStrings(args as JsonValue, s => obfuscator.deobfuscate(s)) as Record<string, unknown>;
+	return mapJsonStrings(args as JsonValue, s => obfuscator.deobfuscateToolText(s)) as Record<string, unknown>;
 }
 
 /** Redact secrets inside a tool call's arguments (same JSON-walk exception as {@link deobfuscateToolArguments}). */

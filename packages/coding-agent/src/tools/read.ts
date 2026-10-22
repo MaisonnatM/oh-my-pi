@@ -112,6 +112,7 @@ import {
 	buildInMemorySelectorResult,
 	buildInMemoryTextResult,
 	contiguousLineNumbers,
+	protectLines,
 	countTextLines,
 	formatLineEntriesWithMode,
 	formatReadHashlineHeader,
@@ -1585,6 +1586,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const visibleSpans: Array<{ startLine: number; endLine: number }> = [];
 		const displayLineByNumber = new Map<number, string>();
 		const fullLines = rawSelector ? undefined : buffered?.addressableLines;
+		if (buffered && this.session.toolOutputBoundary?.enabled) {
+			this.session.toolOutputBoundary.discover(buffered.normalizedText);
+		}
 		let columnCut: ColumnCut | undefined;
 		let cutLines: Set<number> | undefined;
 		let displayContent: { text: string; startLine: number; lineNumbers?: Array<number | null> } | undefined;
@@ -1628,13 +1632,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 			// Column truncation is display-only; clone before stamping ellipsis so
 			// the original on-disk lines stay intact for display reconstruction.
-			let displayLines: string[] = collectedLines;
+			let displayLines = protectLines(this.session.toolOutputBoundary, collectedLines);
 			if (!rawSelector && maxColumns > 0) {
 				let cloned: string[] | undefined;
-				for (let i = 0; i < collectedLines.length; i++) {
-					const { text, wasTruncated } = truncateLine(collectedLines[i], maxColumns);
+				for (let i = 0; i < displayLines.length; i++) {
+					const { text, wasTruncated } = truncateLine(displayLines[i], maxColumns);
 					if (wasTruncated) {
-						if (!cloned) cloned = collectedLines.slice();
+						if (!cloned) cloned = displayLines.slice();
 						cloned[i] = text;
 						columnCut = addColumnCut(columnCut, maxColumns, range.startLine + i);
 						(cutLines ??= new Set()).add(range.startLine + i);
@@ -1668,6 +1672,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					lineText: (lineNumber, sourceText) => {
 						const visibleText = displayLineByNumber.get(lineNumber);
 						if (visibleText !== undefined) return visibleText;
+						sourceText = this.session.toolOutputBoundary?.text(sourceText) ?? sourceText;
 						if (maxColumns <= 0) return sourceText;
 						const truncated = truncateLine(sourceText, maxColumns);
 						if (truncated.wasTruncated) {
@@ -2252,6 +2257,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			// Decode only what survived the sniff.
 			const buffered = wholeFileBytes ? deriveBufferedFileText(wholeFileBytes) : undefined;
 			if (buffered) onBufferedFile?.(buffered.bytes);
+			if (buffered && this.session.toolOutputBoundary?.enabled) {
+				this.session.toolOutputBoundary.discover(buffered.normalizedText);
+			}
 
 			// Unbounded schemes (instruction documents) read whole: no summary, no result limits.
 			if (located?.spec.unbounded) {
@@ -2481,14 +2489,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					// below can be verified against the live file. Mutating it with
 					// ellipsis-truncated text made every long-line file uneditable on
 					// the next edit attempt.
-					let displayLines: string[] = collectedLines;
+					let displayLines = protectLines(this.session.toolOutputBoundary, collectedLines);
 					let cutLines: Set<number> | undefined;
 					if (!rawSelector && maxColumns > 0) {
 						let cloned: string[] | undefined;
-						for (let i = 0; i < collectedLines.length; i++) {
-							const { text, wasTruncated } = truncateLine(collectedLines[i], maxColumns);
+						for (let i = 0; i < displayLines.length; i++) {
+							const { text, wasTruncated } = truncateLine(displayLines[i], maxColumns);
 							if (wasTruncated) {
-								if (!cloned) cloned = collectedLines.slice();
+								if (!cloned) cloned = displayLines.slice();
 								cloned[i] = text;
 								columnCut = addColumnCut(columnCut, maxColumns, startLineDisplay + i);
 								(cutLines ??= new Set()).add(startLineDisplay + i);
@@ -2609,6 +2617,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 								lineText: (lineNumber, sourceText) => {
 									const visibleText = displayLineByNumber.get(lineNumber);
 									if (visibleText !== undefined) return visibleText;
+									sourceText = this.session.toolOutputBoundary?.text(sourceText) ?? sourceText;
 									if (maxColumns <= 0) return sourceText;
 									const truncated = truncateLine(sourceText, maxColumns);
 									if (truncated.wasTruncated) {
@@ -2635,7 +2644,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 					if (firstLineExceedsLimit) {
 						const firstLineBytes = firstLineByteLength ?? 0;
-						const snippet = firstLinePreview ?? { text: "", bytes: 0 };
+						const snippet = this.session.toolOutputBoundary?.enabled
+							? { text: "[Incomplete source line omitted while credential protection is active]", bytes: 0 }
+							: (firstLinePreview ?? { text: "", bytes: 0 });
 
 						if (shouldAddHashLines) {
 							outputText = `[Line ${startLineDisplay} is ${formatBytes(

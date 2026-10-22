@@ -90,6 +90,7 @@ import { estimateContextToolSchemaTokens } from "@oh-my-pi/pi-tui/status-line/co
 import type { PlanModeState } from "../plan-mode/state";
 import advisorBoundaryGuidance from "../prompts/advisor/boundary-guidance.md" with { type: "text" };
 import advisorSystemPrompt from "../prompts/advisor/system.md" with { type: "text" };
+import { deobfuscateToolArguments } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import {
 	AUTO_THINKING,
@@ -1382,7 +1383,13 @@ export class SessionAdvisors {
 			// swaps in a `replace` instance for the exec channel only — the
 			// advisor's own loop keeps the tool it was given — and only when
 			// `edit` was actually granted.
+			const restoreToolArguments = (args: Record<string, unknown>): Record<string, unknown> => {
+				const obfuscator = this.#host.obfuscator();
+				return obfuscator ? deobfuscateToolArguments(obfuscator, args) : args;
+			};
 			const advisorCursorExecHandlers = new CursorExecHandlers({
+				toolOutputBoundary: this.#host.agent.toolOutputBoundary,
+				transformToolCallArguments: restoreToolArguments,
 				cwd: this.#host.sessionManager.getCwd(),
 				getCwd: () => this.#host.sessionManager.getCwd(),
 				tools: bridgeToolMap(advisorToolMap, this.#advisorCreateEditTool),
@@ -1424,6 +1431,8 @@ export class SessionAdvisors {
 				return baseAdvisorStreamFn(requestModel, context, options);
 			};
 			const advisorAgent = new Agent({
+				toolOutputBoundary: this.#host.agent.toolOutputBoundary,
+				transformToolCallArguments: restoreToolArguments,
 				initialState: {
 					systemPrompt,
 					model: advisorModel,

@@ -7,6 +7,7 @@ import {
 	type AgentToolContext,
 	type AgentToolResult,
 	type AgentToolUpdateCallback,
+	type ToolOutputBoundary,
 	joinAdditionalContext,
 	TOOL_RESULT_ADDITIONAL_CONTEXT,
 	type ToolResultWithAdditionalContext,
@@ -71,6 +72,8 @@ export interface CursorMcpResourceAdapter {
 }
 
 interface CursorExecBridgeOptions {
+	toolOutputBoundary?: ToolOutputBoundary;
+	transformToolCallArguments?: (args: Record<string, unknown>) => Record<string, unknown>;
 	cwd: string;
 	getCwd?: () => string;
 	tools: Map<string, AgentTool>;
@@ -221,17 +224,20 @@ async function writeWithoutFollowingLinks(absolutePath: string, payload: string 
 }
 
 function createToolResultMessage(
+	options: CursorExecBridgeOptions,
 	toolCallId: string,
 	toolName: string,
 	result: AgentToolResult<unknown>,
 	isError: boolean,
 ): ToolResultMessage {
+	result = options.toolOutputBoundary?.result(result) ?? result;
 	return {
 		role: "toolResult",
 		toolCallId,
 		toolName,
 		content: result.content,
 		details: result.details,
+		providerMetadata: result.providerMetadata,
 		isError,
 		timestamp: Date.now(),
 	};
@@ -257,6 +263,7 @@ function createBridgeToolContext(options: CursorExecBridgeOptions): {
 	return {
 		context: base && {
 			...base,
+			toolOutputBoundary: options.toolOutputBoundary,
 			rawImages: true,
 			addAdditionalContext: (value: string) => {
 				reported.push(value);
@@ -265,7 +272,8 @@ function createBridgeToolContext(options: CursorExecBridgeOptions): {
 		attach: message => {
 			const additionalContext = joinAdditionalContext(reported);
 			if (additionalContext !== undefined) {
-				(message as ToolResultWithAdditionalContext)[TOOL_RESULT_ADDITIONAL_CONTEXT] = additionalContext;
+				(message as ToolResultWithAdditionalContext)[TOOL_RESULT_ADDITIONAL_CONTEXT] =
+					options.toolOutputBoundary?.text(additionalContext) ?? additionalContext;
 			}
 			return message;
 		},
@@ -289,20 +297,26 @@ async function executeTool(
 	const tool = overrideTool ?? options.getExecutableTool?.(toolName) ?? options.tools.get(toolName);
 	if (!tool) {
 		const result = buildToolErrorResult(`Tool "${toolName}" not available`);
-		return createToolResultMessage(toolCallId, toolName, result, true);
+		return createToolResultMessage(options, toolCallId, toolName, result, true);
 	}
 
 	// Same rule as synthesizeCursorExecToolCall: optional kwargs must be absent,
 	// not `undefined`, or ArkType validation rejects the call.
 	const toolArgs = omitUndefinedArgs(args);
 
-	options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args: toolArgs });
+	options.emitEvent?.({
+		type: "tool_execution_start",
+		toolCallId,
+		toolName,
+		args: options.toolOutputBoundary?.arguments(toolArgs) ?? toolArgs,
+	});
 
 	let result: AgentToolResult<unknown>;
 	let isError = false;
 
 	const onUpdate: AgentToolUpdateCallback<unknown> | undefined = options.emitEvent
 		? partialResult => {
+				if (options.toolOutputBoundary?.enabled) return;
 				const sanitizedResult: AgentToolResult<unknown> = {
 					content: partialResult.content.map(c => (c.type === "text" ? { ...c, text: sanitizeText(c.text) } : c)),
 					details: partialResult.details,
@@ -325,7 +339,13 @@ async function executeTool(
 			name: toolName,
 			arguments: toolArgs,
 		});
-		result = await tool.execute(toolCallId, validatedArgs, undefined, onUpdate, bridgeContext.context);
+		result = await tool.execute(
+			toolCallId,
+			options.transformToolCallArguments?.(validatedArgs) ?? validatedArgs,
+			undefined,
+			onUpdate,
+			bridgeContext.context,
+		);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		result = buildToolErrorResult(message);
@@ -333,13 +353,14 @@ async function executeTool(
 	}
 	isError ||= result.isError === true;
 
-	const sanitizedFinalResult: AgentToolResult<unknown> = {
+	result = {
+		...result,
 		content: result.content.map(c => (c.type === "text" ? { ...c, text: sanitizeText(c.text) } : c)),
-		details: result.details,
 	};
+	const sanitizedFinalResult = options.toolOutputBoundary?.result(result) ?? result;
 	options.emitEvent?.({ type: "tool_execution_end", toolCallId, toolName, result: sanitizedFinalResult, isError });
 
-	return bridgeContext.attach(createToolResultMessage(toolCallId, toolName, result, isError));
+	return bridgeContext.attach(createToolResultMessage(options, toolCallId, toolName, sanitizedFinalResult, isError));
 }
 
 function allowsDirectFileMutation(options: CursorExecBridgeOptions): boolean {
@@ -376,7 +397,7 @@ async function executeDelete(options: CursorExecBridgeOptions, pathArg: string, 
 
 	if (!allowsDirectFileMutation(options)) {
 		const result = buildToolErrorResult(`Tool "${toolName}" not available`);
-		return createToolResultMessage(toolCallId, toolName, result, true);
+		return createToolResultMessage(options, toolCallId, toolName, result, true);
 	}
 
 	// Unlike every other frame, this one mutates the filesystem directly instead
@@ -386,10 +407,15 @@ async function executeDelete(options: CursorExecBridgeOptions, pathArg: string, 
 	// this, a configured `deny` or an `always-ask` session still lost the file.
 	const refusal = refuseByWritePolicy(options, toolName, pathArg);
 	if (refusal) {
-		return createToolResultMessage(toolCallId, toolName, buildToolErrorResult(refusal), true);
+		return createToolResultMessage(options, toolCallId, toolName, buildToolErrorResult(refusal), true);
 	}
 
-	options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args: { path: pathArg } });
+	options.emitEvent?.({
+		type: "tool_execution_start",
+		toolCallId,
+		toolName,
+		args: options.toolOutputBoundary?.arguments({ path: pathArg }) ?? { path: pathArg },
+	});
 
 	const absolutePath = resolveToCwd(pathArg, options.getCwd?.() ?? options.cwd);
 	let isError = false;
@@ -417,8 +443,9 @@ async function executeDelete(options: CursorExecBridgeOptions, pathArg: string, 
 		isError = true;
 	}
 
+	result = options.toolOutputBoundary?.result(result) ?? result;
 	options.emitEvent?.({ type: "tool_execution_end", toolCallId, toolName, result, isError });
-	return createToolResultMessage(toolCallId, toolName, result, isError);
+	return createToolResultMessage(options, toolCallId, toolName, result, isError);
 }
 
 async function resolveCursorReadOffset(
@@ -542,7 +569,13 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		);
 		// A present `limit: 0` asks for zero lines; no selector expresses that.
 		if (composed === null) {
-			return createToolResultMessage(toolCallId, "read", { content: [{ type: "text", text: "" }] }, false);
+			return createToolResultMessage(
+				this.options,
+				toolCallId,
+				"read",
+				{ content: [{ type: "text", text: "" }] },
+				false,
+			);
 		}
 		return await executeTool(this.options, "read", toolCallId, { path: composed });
 	}
@@ -618,7 +651,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		const tool = this.options.tools.get(toolName);
 		if (!tool) {
 			const result = buildToolErrorResult(`Tool "${toolName}" not available`);
-			return createToolResultMessage(toolCallId, toolName, result, true);
+			return createToolResultMessage(this.options, toolCallId, toolName, result, true);
 		}
 
 		const timeoutSeconds = shellDeadlineSeconds(args);
@@ -628,7 +661,12 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			timeout: timeoutSeconds,
 		});
 
-		this.options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args: toolArgs });
+		this.options.emitEvent?.({
+			type: "tool_execution_start",
+			toolCallId,
+			toolName,
+			args: this.options.toolOutputBoundary?.arguments(toolArgs) ?? toolArgs,
+		});
 
 		let result: AgentToolResult<unknown>;
 		let isError = false;
@@ -638,6 +676,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		let streamedSanitizedText = "";
 		let canStreamSanitizedDelta = true;
 		const onUpdate: AgentToolUpdateCallback<unknown> = partialResult => {
+			if (this.options.toolOutputBoundary?.enabled) return;
 			const newRawText = partialResult.content.map(c => (c.type === "text" ? c.text : "")).join("");
 			if (newRawText === rawText) {
 				return;
@@ -680,13 +719,20 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 				name: toolName,
 				arguments: toolArgs,
 			});
-			result = await tool.execute(toolCallId, validatedArgs, undefined, onUpdate, bridgeContext.context);
+			result = await tool.execute(
+				toolCallId,
+				this.options.transformToolCallArguments?.(validatedArgs) ?? validatedArgs,
+				undefined,
+				onUpdate,
+				bridgeContext.context,
+			);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			result = buildToolErrorResult(message);
 			isError = true;
 		}
 		isError ||= result.isError === true;
+		result = this.options.toolOutputBoundary?.result(result) ?? result;
 
 		// onUpdate may not fire for every chunk — flush any remaining output
 		// from the final result that wasn't already streamed.
@@ -704,8 +750,8 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		}
 
 		const sanitizedFinalResult: AgentToolResult<unknown> = {
+			...result,
 			content: result.content.map(c => (c.type === "text" ? { ...c, text: sanitizeText(c.text) } : c)),
-			details: result.details,
 		};
 		this.options.emitEvent?.({
 			type: "tool_execution_end",
@@ -714,7 +760,9 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			result: sanitizedFinalResult,
 			isError,
 		});
-		return bridgeContext.attach(createToolResultMessage(toolCallId, toolName, result, isError));
+		return bridgeContext.attach(
+			createToolResultMessage(this.options, toolCallId, toolName, sanitizedFinalResult, isError),
+		);
 	}
 
 	async diagnostics(args: Parameters<NonNullable<ICursorExecHandlers["diagnostics"]>>[0]) {
@@ -748,7 +796,13 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		// string for it; no `read` selector expresses that, so answer directly
 		// rather than falling back to a whole-file read.
 		if (composed === null) {
-			return createToolResultMessage(call.toolCallId, "read", { content: [{ type: "text", text: "" }] }, false);
+			return createToolResultMessage(
+				this.options,
+				call.toolCallId,
+				"read",
+				{ content: [{ type: "text", text: "" }] },
+				false,
+			);
 		}
 		return await executeTool(this.options, "read", call.toolCallId, { path: cursorRawReadPath(composed) });
 	}
@@ -851,25 +905,33 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 	 * it came from. An absent `server` filter means "all of them".
 	 */
 	async listMcpResources({ server }: { server?: string }): Promise<CursorMcpResource[]> {
-		const mcp = this.options.mcpResources;
-		if (!mcp) return [];
-		const names = server ? [server] : mcp.serverNames();
-		// Concurrently: each name may block on that server's first catalog load,
-		// and a slow server should not delay the rest of the listing.
-		const catalogs = await Promise.all(names.map(async name => [name, await mcp.getServerResources(name)] as const));
-		const listed: CursorMcpResource[] = [];
-		for (const [name, catalog] of catalogs) {
-			for (const resource of catalog?.resources ?? []) {
-				listed.push({
-					uri: resource.uri,
-					name: resource.name,
-					description: resource.description,
-					mimeType: resource.mimeType,
-					server: name,
-				});
+		try {
+			const mcp = this.options.mcpResources;
+			if (!mcp) return [];
+			const names = server ? [server] : mcp.serverNames();
+			// Concurrently: each name may block on that server's first catalog load,
+			// and a slow server should not delay the rest of the listing.
+			const catalogs = await Promise.all(
+				names.map(async name => [name, await mcp.getServerResources(name)] as const),
+			);
+			const listed: CursorMcpResource[] = [];
+			for (const [name, catalog] of catalogs) {
+				for (const resource of catalog?.resources ?? []) {
+					listed.push({
+						uri: resource.uri,
+						name: resource.name,
+						description: resource.description,
+						mimeType: resource.mimeType,
+						server: name,
+					});
+				}
 			}
+			return this.options.toolOutputBoundary?.result({ content: [], details: listed }).details ?? listed;
+		} catch (error) {
+			if (!this.options.toolOutputBoundary?.enabled) throw error;
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(this.options.toolOutputBoundary.text(message));
 		}
-		return listed;
 	}
 
 	/**
@@ -897,50 +959,61 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		uri: string;
 		downloadPath?: string;
 	}): Promise<CursorMcpResourceContent | null> {
-		if (downloadPath) {
-			if (!allowsDirectFileMutation(this.options)) {
-				throw new Error('Tool "write" not available: this session cannot download resources to disk.');
+		try {
+			if (downloadPath) {
+				if (!allowsDirectFileMutation(this.options)) {
+					throw new Error('Tool "write" not available: this session cannot download resources to disk.');
+				}
+				const refusal = refuseByWritePolicy(this.options, "write", downloadPath);
+				if (refusal) throw new Error(refusal);
 			}
-			const refusal = refuseByWritePolicy(this.options, "write", downloadPath);
-			if (refusal) throw new Error(refusal);
-		}
-		const mcp = this.options.mcpResources;
-		if (!mcp) return null;
-		const read = await mcp.readServerResource(server, uri);
-		if (!read) return null;
-		// The mime type must describe the bytes actually sent, not whatever item
-		// happened to be first: an image blob followed by a text note would
-		// otherwise label the text `image/png` and mislead the model about what
-		// it is holding. Each branch below takes the type from its own producer.
-		const textItems = read.contents.filter(item => item.text !== undefined);
-		const texts = textItems.map(item => item.text as string);
-		const blobItem = read.contents.find(item => item.blob !== undefined);
-		const blob = blobItem?.blob;
-		const textMimeType = textItems[0]?.mimeType;
-		const blobMimeType = blobItem?.mimeType;
+			const mcp = this.options.mcpResources;
+			if (!mcp) return null;
+			const read = await mcp.readServerResource(server, uri);
+			if (!read) return null;
+			// The mime type must describe the bytes actually sent, not whatever item
+			// happened to be first: an image blob followed by a text note would
+			// otherwise label the text `image/png` and mislead the model about what
+			// it is holding. Each branch below takes the type from its own producer.
+			const textItems = read.contents.filter(item => item.text !== undefined);
+			const texts = textItems.map(item => item.text as string);
+			const blobItem = read.contents.find(item => item.blob !== undefined);
+			const blob = blobItem?.blob;
+			const textMimeType = textItems[0]?.mimeType;
+			const blobMimeType = blobItem?.mimeType;
 
-		if (downloadPath) {
-			// Text resources download as their own bytes; a blob decodes first.
-			const payload =
-				texts.length > 0 ? texts.join("\n") : blob !== undefined ? Buffer.from(blob, "base64") : undefined;
-			if (payload === undefined) return null;
-			// The path is workspace-relative BY CONTRACT, but it arrives from the
-			// server, and `resolveToCwd` deliberately honors absolute paths and
-			// `..` for user-authored tool input. Taking it at its word would let a
-			// frame write anywhere this process can reach, so confine it here
-			// rather than trusting the declaration.
-			const cwd = this.options.getCwd?.() ?? this.options.cwd;
-			const absolutePath = confineToWorkspace(downloadPath, cwd);
-			if (!absolutePath) throw new Error(`Refusing to download outside the workspace: ${downloadPath}`);
-			await writeWithoutFollowingLinks(absolutePath, payload);
-			// The path echoed back is the one the frame asked for; the model
-			// addresses it the same relative way.
-			return { uri, mimeType: texts.length > 0 ? textMimeType : blobMimeType, downloadPath };
-		}
+			if (downloadPath) {
+				// Text resources download as their own bytes; a blob decodes first.
+				const payload =
+					texts.length > 0 ? texts.join("\n") : blob !== undefined ? Buffer.from(blob, "base64") : undefined;
+				if (payload === undefined) return null;
+				// The path is workspace-relative BY CONTRACT, but it arrives from the
+				// server, and `resolveToCwd` deliberately honors absolute paths and
+				// `..` for user-authored tool input. Taking it at its word would let a
+				// frame write anywhere this process can reach, so confine it here
+				// rather than trusting the declaration.
+				const cwd = this.options.getCwd?.() ?? this.options.cwd;
+				const absolutePath = confineToWorkspace(downloadPath, cwd);
+				if (!absolutePath) throw new Error(`Refusing to download outside the workspace: ${downloadPath}`);
+				await writeWithoutFollowingLinks(absolutePath, payload);
+				// The path echoed back is the one the frame asked for; the model
+				// addresses it the same relative way.
+				return { uri, mimeType: texts.length > 0 ? textMimeType : blobMimeType, downloadPath };
+			}
 
-		if (texts.length > 0) return { uri, mimeType: textMimeType, text: texts.join("\n") };
-		if (blob === undefined) return null;
-		return { uri, mimeType: blobMimeType, blob: Buffer.from(blob, "base64") };
+			if (texts.length > 0)
+				return {
+					uri,
+					mimeType: textMimeType,
+					text: this.options.toolOutputBoundary?.text(texts.join("\n")) ?? texts.join("\n"),
+				};
+			if (blob === undefined) return null;
+			return { uri, mimeType: blobMimeType, blob: Buffer.from(blob, "base64") };
+		} catch (error) {
+			if (!this.options.toolOutputBoundary?.enabled) throw error;
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(this.options.toolOutputBoundary.text(message));
+		}
 	}
 
 	/**
@@ -1024,7 +1097,8 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			}
 		}
 
-		const result = buildTodoSyncResult(toolCallId, phases, error);
+		const raw = buildTodoSyncResult(toolCallId, phases, error);
+		const result = { ...raw, ...(this.options.toolOutputBoundary?.result(raw) ?? raw) };
 		// This completion is emitted synchronously mid-parse, while the streamed
 		// `toolcall_start` that creates the visible card rides
 		// `AssistantMessageEventStream` and lands a microtask later. When Cursor
@@ -1054,7 +1128,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			if (!replaceTool) {
 				const availableTools = Array.from(this.options.tools.keys()).filter(name => name.startsWith("mcp__"));
 				const message = formatMcpToolErrorMessage(toolName, availableTools);
-				return createToolResultMessage(toolCallId, toolName, buildToolErrorResult(message), true);
+				return createToolResultMessage(this.options, toolCallId, toolName, buildToolErrorResult(message), true);
 			}
 			return await executeTool(this.options, "edit", toolCallId, normalizeCursorReplaceArgs(args), replaceTool);
 		}
@@ -1063,7 +1137,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			const availableTools = Array.from(this.options.tools.keys()).filter(name => name.startsWith("mcp__"));
 			const message = formatMcpToolErrorMessage(toolName, availableTools);
 			const result = buildToolErrorResult(message);
-			return createToolResultMessage(toolCallId, toolName, result, true);
+			return createToolResultMessage(this.options, toolCallId, toolName, result, true);
 		}
 
 		const toolResultMessage = await executeTool(this.options, toolName, toolCallId, args);

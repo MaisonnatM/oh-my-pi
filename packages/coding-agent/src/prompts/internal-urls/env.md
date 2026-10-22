@@ -1,0 +1,1 @@
+`env://` lists sorted current-process environment names only. `env://NAME` reports the name and `missing`, `empty`, or `set` state. Values and value-derived metadata are never exposed. Read-only. Does not read dotenv files or run shell/direnv commands. Names must match `[A-Za-z_][A-Za-z0-9_]*`; paths, queries, and fragments are rejected.

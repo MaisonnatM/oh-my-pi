@@ -1,14 +1,14 @@
 # Secret Obfuscation
 
-Redacts sensitive values (API keys, tokens, passwords) in conversation messages sent to LLM providers. When enabled, configured secrets and built-in credential-shaped token patterns are replaced in supported message and replay text fields. Static system prompts, static tool definitions, and binary payloads are not redacted by this subsystem. Reversible placeholders are restored in model-authored tool arguments before execution and when local session context is rebuilt for display or resume.
+Masks recognized credential values before tool results reach a model, tool-result events, or new transcript result records. Protection is enabled by default for coding-agent SDK and CLI sessions. The same session registry restores reversible placeholders for private execution inputs. Static system prompts, static tool definitions, and binary payloads are outside this protection.
 
 ## Enabling
 
-Disabled by default. Toggle via `/settings` UI or directly in `config.yml`:
+Enabled by default, including when an existing configuration has no `secrets.enabled` setting. An explicit `false` disables future tool-output and provider credential protection for that session. Toggle **Hide Secrets** in `/settings`, or opt out in `config.yml`:
 
 ```yaml
 secrets:
-  enabled: true
+  enabled: false
 ```
 
 ## How it works
@@ -18,10 +18,15 @@ secrets:
    - **`secrets.yml` files** (see below)
    - Built-in reversible regexes for common credential shapes that appear only in session content or tool results: GitHub, GitLab, OpenAI, and Anthropic tokens, AWS access keys, Google API keys, Slack tokens, npm tokens, Stripe secret and restricted keys and webhook secrets, Hugging Face tokens, SendGrid keys, JWTs, Bearer header tokens, and PEM private key blocks
    - Passwords embedded in connection-URL environment values — any variable holding a `scheme://user:password@host`-style value (for example `DATABASE_URL`) has its password registered regardless of the variable name when it is at least 8 characters long. Both raw and percent-decoded forms are collected when they meet that limit.
+   - Context-confirmed values in dotenv and shell assignments, quoted JSON and YAML fields, Basic and Bearer authorization values, and connection-URL passwords. Strong fields include `PASSWORD`, `PASSWD`, `API_KEY`, `SECRET_KEY`, `PRIVATE_KEY`, `ACCESS_KEY`, and `CREDENTIAL(S)`; their quoted or structured string values mask even short passwords. Ambiguous names (`KEY`, `PRIVATE`, `TOKEN`, `SECRET`, `PASS`, `OAUTH`, `AUTH`, `AUTHORIZATION`) require literal values of at least eight characters. Standalone uppercase dotenv assignments can confirm short unquoted scalar values. Source expressions, type annotations, booleans, and schema object delimiters remain visible. Separated prefixes such as `DATABASE_PASSWORD` are supported; `token_expiry_seconds` remains readable.
 
-2. Provider-visible text has matching values replaced with deterministic placeholders such as `$$3P8W5JH1TK2Q$$`, `$$3P8W5JH1TK2Q:L$$`, or `$$GITHUBTOKEN_3P8W5JH1TK2Q:L$$`.
+2. Complete tool results are inspected after result hooks, before publication. Supported textual JSON data includes result text, nested details, provider metadata, and dynamic metadata keys. Values discovered in one field are masked elsewhere in that result. Credential names and separators remain visible where possible.
 
-3. Live model-authored tool arguments are deep-walked and placeholders are restored before the tool executes. Session context restores placeholders for local display/resume and re-obfuscates it before provider replay. Replace-mode substitutions are one-way and are not restored.
+3. Matching values use deterministic reversible placeholders such as `$$3P8W5JH1TK2Q$$` or `$$TOOLCREDENTIAL_3P8W5JH1TK2Q:L$$`. Live tool arguments restore those values before execution. The public argument copies stay masked.
+
+4. Protected tool-result messages stay masked on disk and after session rebuild. Protected public assistant events and ephemeral replies keep placeholders too; local diagnostic display remains separate. A placeholder learned only from tool output cannot be restored in a fresh process until its source is read again. Execution rejects unresolved generated placeholders with a re-read instruction rather than writing placeholder text into a file. Replace-mode substitutions remain one-way.
+
+Generated placeholder syntax is reserved: a 12-character uppercase base36 hash, optionally preceded by a friendly label and followed by a case hint, inside `$$` delimiters. A literal with that exact shape is indistinguishable from a generated placeholder after restart. Shorter text such as `$$ABCD$$` remains literal.
 
 Two modes control what happens to each secret:
 
@@ -30,7 +35,21 @@ Two modes control what happens to each secret:
 | `obfuscate` (default) | Replaced with a deterministic `$$HASH(:hint)$$` or `$$FRIENDLY_HASH(:hint)$$` placeholder     | Yes        |
 | `replace`             | Replaced with the configured `replacement`, or a deterministic same-length value when omitted | No         |
 
-Obfuscate-mode plain values and regex matches shorter than 8 characters are ignored to avoid redacting ordinary short words. Replace mode can handle short values; a replace-mode regex with no custom replacement is rejected only when every possible 1–2 character match would be impossible to redact to a distinct stable value.
+Configured obfuscate-mode plain values and vendor regex matches shorter than 8 characters are ignored to avoid redacting ordinary short words. Context-confirmed sensitive fields and assignments also mask nonempty short passwords. Short values are replaced at confirmed locations or matching complete result fields, not registered as global one-character substring matches. Replace mode can handle short values; a replace-mode regex with no custom replacement is rejected only when every possible 1–2 character match would be impossible to redact to a distinct stable value.
+
+## Tool output, live previews, and limits
+
+Protection withholds content-bearing live tool updates and Cursor shell stdout until a sanitized final result is available. A secret can span chunks, so independently masking each chunk is not safe for the supported regex policy. Starts and final completions remain visible.
+
+Read, grep, shell, and generic output formatting protect display text before destructive byte or column truncation. Grep discovers multiline credentials from complete source snapshots. Without a reusable snapshot, it reads at most 4 MiB of source context; oversized, unavailable, changed, or truncated context produces a safe omission notice instead of match text.
+
+Shell inspection buffers complete decoded output up to the configured artifact byte cap, or 8 MiB when that cap is disabled. Output that exceeds this inspection capture has its preview omitted. A protected read of the raw artifact can inspect source ranges.
+
+This is textual detection, not a guarantee that every private value is recognizable. Unknown naked opaque strings, unfamiliar field names, arbitrary encodings, encrypted content, and credentials inside images are not detectable. Unquoted identifier-like values in YAML and `.properties` files may be treated as source references rather than credentials; quote literal values or register them in `secrets.yml`. Image transport bytes are preserved. Old transcript files are not rewritten.
+
+Source files, private read snapshots, raw local execution artifacts, and arbitrary third-party logging are outside the storage promise. Every supported model-facing tool read of an artifact or process output still passes through protection. This feature does not encrypt local files or erase secrets already recorded elsewhere.
+
+`env://` provides environment variable names and presence without values. Its scope is the current omp process environment. It does not inspect dotenv files, direnv state, or per-command shell overrides.
 
 ## secrets.yml
 

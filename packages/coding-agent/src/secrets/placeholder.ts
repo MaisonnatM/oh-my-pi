@@ -369,6 +369,11 @@ export function buildPlaceholder(hint: PlaceholderCaseHint | undefined, base: st
 /** Regex matching `$$HASH$$`, `$$HASH:U$$`, and `$$FRIENDLY_HASH(:hint)$$` placeholders. */
 export const PLACEHOLDER_RE = /\$\$(?:[A-Z0-9]+_)?[A-Z0-9]{4,}(?::[ULCM])?\$\$/g;
 
+export const GENERATED_PLACEHOLDER_RE = new RegExp(
+	`\\$\\$(?:[A-Z0-9]{1,${MAX_FRIENDLY_NAME_LEN}}_)?[A-Z0-9]{${HASH_LEN}}(?::[ULCM])?\\$\\$`,
+	"g",
+);
+
 export function resumePlaceholderScanAfterRejectedCandidate(match: RegExpExecArray): void {
 	// RegExp#exec does not find overlapping matches. Restart at the rejected
 	// candidate's closing delimiter, which can open an immediately adjacent placeholder.

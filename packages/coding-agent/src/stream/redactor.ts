@@ -1,13 +1,10 @@
 import { getAgentDir, getDotenvEnvValues, logger } from "@oh-my-pi/pi-utils";
 import { builtinCredentialSecretEntries, collectEnvSecrets, loadSecrets } from "../secrets";
-import { CREDENTIAL_PREFIX_RULES } from "../secrets/patterns";
+import { credentialValueSpans, CREDENTIAL_PREFIX_RULES } from "../secrets/patterns";
 
 const REDACTION = "••••••";
 const MIN_PLAIN_SECRET_LENGTH = 8;
 const MIN_TYPED_PREFIX_LENGTH = 6;
-const SECRET_NAME_RE = /(KEY|SECRET|TOKEN|PASSWORD|PASSWD|PASS|AUTH|CREDENTIAL|PRIVATE|OAUTH)(_|$)/i;
-const ASSIGNMENT_RE = /["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*(?:=|:)\s*(?:"([^"\s]{4,})"|'([^'\s]{4,})'|([^\s"']{4,}))/g;
-const CONNECTION_URL_RE = /[a-z][a-z0-9+.-]*:\/\/[^/:@?#\s]*:([^/?#@\s]+)@/gi;
 
 interface PlainSecret {
 	readonly value: string;
@@ -82,22 +79,7 @@ export class StreamRedactor {
 			}
 		}
 
-		ASSIGNMENT_RE.lastIndex = 0;
-		let assignment: RegExpExecArray | null;
-		while ((assignment = ASSIGNMENT_RE.exec(plain)) !== null) {
-			if (!SECRET_NAME_RE.test(assignment[1])) continue;
-			const value = assignment[2] ?? assignment[3] ?? assignment[4];
-			const start = assignment.index + assignment[0].lastIndexOf(value);
-			spans.push(start, start + value.length);
-		}
-
-		CONNECTION_URL_RE.lastIndex = 0;
-		let connection: RegExpExecArray | null;
-		while ((connection = CONNECTION_URL_RE.exec(plain)) !== null) {
-			const password = connection[1];
-			const start = connection.index + connection[0].lastIndexOf(password);
-			spans.push(start, start + password.length);
-		}
+		for (const span of credentialValueSpans(plain)) spans.push(span.start, span.end);
 
 		for (const secret of this.#plainSecrets) {
 			let start = plain.indexOf(secret.prefix);

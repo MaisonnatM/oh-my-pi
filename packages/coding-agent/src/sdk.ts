@@ -172,6 +172,7 @@ import { AgentLifecycleManager } from "./registry/agent-lifecycle";
 import { type AgentKind, type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
 import {
 	buildSecretObfuscator,
+	CredentialToolOutputBoundary,
 	deobfuscateSessionContext,
 	deobfuscateToolArguments,
 	obfuscateMessages,
@@ -2006,6 +2007,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	let obfuscator: SecretObfuscator | undefined = cfgSecretsEnabled.get(settings)
 		? await buildSecretObfuscator(cwd, agentDir, options.agentDir)
 		: undefined;
+	const toolOutputBoundary = new CredentialToolOutputBoundary(() => obfuscator);
 
 	// An abnormal process exit after a non-terminal message tail is durable
 	// evidence that the old process can no longer finish that turn. Preserve the
@@ -2358,6 +2360,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 		};
 		const toolSession: ToolSession = {
+			toolOutputBoundary,
 			get cwd() {
 				return sessionManager.getCwd();
 			},
@@ -3876,6 +3879,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			readServerResource: (name, uri) => mcpManager.readServerResource(name, uri),
 		};
 		const cursorExecHandlers = new CursorExecHandlers({
+			toolOutputBoundary,
+			transformToolCallArguments: args => (obfuscator ? deobfuscateToolArguments(obfuscator, args) : args),
 			cwd,
 			// The session's cwd moves (`/cd`, resume, branch restore) while this
 			// bridge is built once at startup. Path-confining frames — the native
@@ -4529,6 +4534,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const speculativeToolExecution = createSpeculativeToolExecutionConfig(settings, toolSession, extensionRunner);
 
 		agent = new Agent({
+			toolOutputBoundary,
 			initialState: {
 				systemPrompt,
 				model,
@@ -5384,6 +5390,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				const captureDateCwdReminder = new DateCwdReminderInjector();
 				return new Agent({
 					...captureOptions,
+					toolOutputBoundary,
 					cwd: sessionManager.getCwd(),
 					cwdResolver: () => sessionManager.getCwd(),
 					convertToLlm: convertToLlmFinal,

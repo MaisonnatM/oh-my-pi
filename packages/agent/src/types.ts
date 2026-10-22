@@ -413,6 +413,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Use for deobfuscating secrets or rewriting arguments.
 	 */
 	transformToolCallArguments?: (args: Record<string, unknown>, toolName: string) => Record<string, unknown>;
+	/** Protect public tool data after hooks and before events or retained messages. */
+	toolOutputBoundary?: ToolOutputBoundary;
 	/**
 	 * Opt-in speculative execution for finalized, discard-safe tool calls.
 	 *
@@ -1078,11 +1080,23 @@ export type ToolApprovalDecision =
 	  };
 export type ToolApproval = ToolApprovalDecision | ((args: unknown) => ToolApprovalDecision);
 
+/** Host policy for supported tool output. Active policies withhold partial payloads. */
+export interface ToolOutputBoundary {
+	readonly enabled: boolean;
+	arguments(args: Record<string, unknown>): Record<string, unknown>;
+	result<T>(result: AgentToolResult<T>): AgentToolResult<T>;
+	/** Register complete source credentials before selecting display fragments. */
+	discover(text: string): void;
+	text(text: string): string;
+}
+
 /**
  * Context passed to tool execution.
  * Apps can extend via declaration merging.
  */
 export interface AgentToolContext {
+	/** Host publication policy, also available before destructive display truncation. */
+	toolOutputBoundary?: ToolOutputBoundary;
 	/**
 	 * Attach trusted, agent-authored instructions to the next provider request.
 	 * The host emits them after tool results with developer/system priority where

@@ -19,8 +19,10 @@ import {
 	AgentServerMessageSchema,
 	DeleteArgsSchema,
 	ExecServerMessageSchema,
+	ListMcpResourcesExecArgsSchema,
 	McpArgsSchema,
 	ReadArgsSchema,
+	ReadMcpResourceExecArgsSchema,
 	ShellArgsSchema,
 } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import { create, fromBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
@@ -38,6 +40,11 @@ import {
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import {
+	builtinCredentialSecretEntries,
+	CredentialToolOutputBoundary,
+	SecretObfuscator,
+} from "@oh-my-pi/pi-coding-agent/secrets";
 import { BUILTIN_TOOLS, GrepTool, ReadTool, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools/todo";
@@ -1167,6 +1174,55 @@ describe("CursorExecHandlers mounted tool bridge", () => {
 		expect(result.content.find(block => block.type === "text")?.text).toContain("blocked by user policy");
 	});
 
+	for (const enabled of [true, false]) {
+		it(`sanitizes terminal text with a configured ${enabled ? "enabled" : "disabled"} credential boundary`, async () => {
+			const password = "synthetic cursor text password 47";
+			const obfuscator = new SecretObfuscator(builtinCredentialSecretEntries(), "synthetic-cursor-text-key");
+			obfuscator.setObfuscating(enabled);
+			const image = {
+				type: "image" as const,
+				mimeType: "image/png",
+				data: Buffer.from(password).toString("base64"),
+			};
+			const tool: AgentTool = {
+				name: "fixture",
+				label: "Fixture",
+				description: "Return synthetic terminal text and image data.",
+				parameters: type({}),
+				async execute() {
+					return {
+						content: [{ type: "text", text: `\x1b[31mPASSWORD="${password}"\x1b[0m\nvisible\x00` }, image],
+					};
+				},
+			};
+			const events: AgentEvent[] = [];
+			const handlers = new CursorExecHandlers({
+				cwd: ".",
+				tools: new Map([[tool.name, tool]]),
+				toolOutputBoundary: new CredentialToolOutputBoundary(() => obfuscator),
+				emitEvent: event => events.push(event),
+			});
+			const result = await handlers.mcp({
+				name: tool.name,
+				providerIdentifier: "pi-agent",
+				toolName: tool.name,
+				toolCallId: "sanitized-result",
+				args: {},
+				rawArgs: {},
+			});
+			expect(result.isError).toBe(false);
+			const text = result.content.find(block => block.type === "text")?.text;
+			if (text === undefined) throw new Error("Expected sanitized text.");
+			expect(obfuscator.deobfuscate(text)).toBe(`PASSWORD="${password}"\nvisible`);
+			expect(result.content[1]).toEqual(image);
+			expect(events.find(event => event.type === "tool_execution_end")).toMatchObject({
+				result: { content: result.content },
+			});
+			if (enabled) expect(text).not.toContain(password);
+			else expect(text).toBe(`PASSWORD="${password}"\nvisible`);
+		});
+	}
+
 	it("lists resources from the session's live MCP servers", async () => {
 		// The provider used to answer an empty catalog unconditionally, hiding
 		// resources the session holds live connections to. Every entry must
@@ -1191,6 +1247,95 @@ describe("CursorExecHandlers mounted tool bridge", () => {
 		// A server filter narrows to that server alone.
 		expect((await handlers.listMcpResources({ server: "issues" })).map(r => r.uri)).toEqual(["issues://open"]);
 	});
+
+	for (const enabled of [true, false]) {
+		it(`protects MCP resource callback and exec-response errors with protection ${enabled ? "enabled" : "disabled"}`, async () => {
+			const password = "synthetic resource backend password 47";
+			const rawMessage = `Backend rejected PASSWORD="${password}"`;
+			const obfuscator = new SecretObfuscator(builtinCredentialSecretEntries(), "synthetic-resource-key");
+			obfuscator.setObfuscating(enabled);
+			const handlers = new CursorExecHandlers({
+				cwd: ".",
+				tools: new Map(),
+				toolOutputBoundary: new CredentialToolOutputBoundary(() => obfuscator),
+				mcpResources: {
+					serverNames: () => ["docs"],
+					getServerResources: async () => {
+						throw new Error(rawMessage);
+					},
+					readServerResource: async () => {
+						throw new Error(rawMessage);
+					},
+				},
+			});
+
+			for (const operation of ["list", "read"]) {
+				const directError: unknown = await (
+					operation === "list"
+						? handlers.listMcpResources({})
+						: handlers.readMcpResource({ server: "docs", uri: "docs://readme" })
+				).catch((error: unknown) => error);
+				if (!(directError instanceof Error)) throw new Error("Expected a resource callback error.");
+				expect(directError.message).toContain("Backend rejected PASSWORD=");
+				expect(obfuscator.deobfuscate(directError.message)).toBe(rawMessage);
+				if (enabled) expect(directError.message).not.toContain(password);
+				else expect(directError.message).toBe(rawMessage);
+
+				const written: Buffer[] = [];
+				const transport = {
+					write(chunk: Buffer) {
+						written.push(chunk);
+						return true;
+					},
+				} as unknown as Parameters<typeof handleServerMessage>[5];
+				await handleServerMessage(
+					create(AgentServerMessageSchema, {
+						message: {
+							case: "execServerMessage",
+							value: create(ExecServerMessageSchema, {
+								id: 11,
+								execId: `resource-error-${operation}`,
+								message:
+									operation === "list"
+										? { case: "listMcpResourcesExecArgs", value: create(ListMcpResourcesExecArgsSchema, {}) }
+										: {
+												case: "readMcpResourceExecArgs",
+												value: create(ReadMcpResourceExecArgsSchema, {
+													server: "docs",
+													uri: "docs://readme",
+												}),
+											},
+							}),
+						},
+					}),
+					cursorAssistantMessage(),
+					new AssistantMessageEventStream(),
+					newBlockState(),
+					new Map(),
+					transport,
+					handlers,
+					undefined,
+					{ sawTokenDelta: false },
+					[],
+				);
+
+				expect(written).toHaveLength(1);
+				const frame = written[0]!;
+				const answer = fromBinary(AgentClientMessageSchema, frame.subarray(5, 5 + frame.readUInt32BE(1)));
+				if (answer.message.case !== "execClientMessage") throw new Error("Expected an exec response.");
+				const response = answer.message.value.message;
+				if (response.case !== "listMcpResourcesExecResult" && response.case !== "readMcpResourceExecResult") {
+					throw new Error("Expected a resource response.");
+				}
+				const result = response.value.result;
+				if (result.case !== "error") throw new Error("Expected a resource error response.");
+				expect(result.value.error).toContain("Backend rejected PASSWORD=");
+				expect(obfuscator.deobfuscate(result.value.error)).toBe(rawMessage);
+				if (enabled) expect(result.value.error).not.toContain(password);
+				else expect(result.value.error).toBe(rawMessage);
+			}
+		});
+	}
 
 	it("waits for a server's catalog instead of reporting it empty", async () => {
 		// A server registers its tools before its resource catalog finishes

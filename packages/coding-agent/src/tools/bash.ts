@@ -715,8 +715,22 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			requestedTimeoutSec?: number;
 			notices?: readonly string[];
 			wallTimeMs?: number;
+			outputProtected?: boolean;
 		} = {},
 	): Promise<AgentToolResult<BashToolDetails>> {
+		if (this.session.toolOutputBoundary?.enabled) {
+			result = {
+				...result,
+				output:
+					!options.outputProtected &&
+					(result.truncated ||
+						("columnTruncatedLines" in result &&
+							typeof result.columnTruncatedLines === "number" &&
+							result.columnTruncatedLines > 0))
+						? "[Incomplete terminal capture omitted while credential protection is active]"
+						: this.session.toolOutputBoundary.text(result.output),
+			};
+		}
 		const exitCode = result.exitCode;
 		const failedExit = exitCode !== undefined && exitCode !== 0;
 
@@ -821,7 +835,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			details.requestedTimeoutSeconds = options.requestedTimeoutSec;
 		}
 		const lines: string[] = [];
-		const trimmedPreview = previewText.trimEnd();
+		const trimmedPreview = this.session.toolOutputBoundary?.enabled ? "" : previewText.trimEnd();
 		if (trimmedPreview.length > 0) {
 			lines.push(trimmedPreview, "");
 		}
@@ -899,8 +913,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				};
 				const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
 				const wallTimeStart = performance.now();
+				const protectOutput = this.session.toolOutputBoundary?.enabled
+					? (text: string) => this.session.toolOutputBoundary!.text(text)
+					: undefined;
 				try {
 					const result = await executeBash(options.command, {
+						protectOutput,
 						cwd: options.commandCwd,
 						env: options.sessionEnv,
 						// A call that starts in the foreground runs in the session's
@@ -918,9 +936,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						artifactPath,
 						artifactId,
 						onChunk: chunk => outputTap.append(chunk),
-						onPreview: text => {
-							void report(text, { output: text, async: { state: "running", jobId, type: "bash" } });
-						},
+						onPreview: this.session.toolOutputBoundary?.enabled
+							? undefined
+							: text => {
+									void report(text, { output: text, async: { state: "running", jobId, type: "bash" } });
+								},
 						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
 						streams,
 						onStart: probe => {
@@ -937,6 +957,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						requestedTimeoutSec: options.requestedTimeoutSec,
 						notices,
 						wallTimeMs,
+						outputProtected: protectOutput !== undefined,
 					});
 					const finalText = this.#extractTextResult(finalResult);
 					latestText = finalText;
@@ -1593,6 +1614,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			pendingNotices.push("pty requested but unavailable in this environment; ran without a terminal");
 		}
 		const wallTimeStart = performance.now();
+		const protectOutput =
+			!interactiveUi && this.session.toolOutputBoundary?.enabled
+				? (text: string) => this.session.toolOutputBoundary!.text(text)
+				: undefined;
 		const result: BashResult | BashInteractiveResult = interactiveUi
 			? await runInteractiveBashPty(interactiveUi, {
 					// PTY bypasses executeBash, so feed it the direnv-transformed
@@ -1609,6 +1634,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			: // executeBash runs its OWN direnv preflight internally — pass the RAW
 				// command here so the unset prefix is not applied twice.
 				await executeBash(command, {
+					protectOutput,
 					cwd: commandCwd,
 					env: sessionEnv,
 					sessionKey: sessionId,
@@ -1620,7 +1646,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					artifactPath,
 					artifactId,
 					// Stream the sink's own inline view rather than re-buffering chunks.
-					onPreview: onUpdate ? text => onUpdate({ content: [{ type: "text", text }], details: {} }) : undefined,
+					onPreview:
+						onUpdate && !this.session.toolOutputBoundary?.enabled
+							? text => onUpdate({ content: [{ type: "text", text }], details: {} })
+							: undefined,
 					onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
 					onSessionShellBusy: () => pendingNotices.push(SESSION_SHELL_BUSY_NOTICE),
 				});
@@ -1653,6 +1682,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			requestedTimeoutSec,
 			notices: pendingNotices,
 			wallTimeMs,
+			outputProtected: protectOutput !== undefined,
 		});
 	}
 }

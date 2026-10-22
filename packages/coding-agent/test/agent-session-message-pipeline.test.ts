@@ -109,6 +109,8 @@ describe("AgentSession message pipeline", () => {
 	});
 
 	function sideSession(chunks: string[], finalFlush = false): AgentSession {
+		const obfuscator = finalFlush ? new SecretObfuscator([{ type: "plain", content: "test-secret" }]) : undefined;
+		obfuscator?.setObfuscating(false);
 		const session = new AgentSession({
 			agent: new Agent({
 				initialState: { model: getBundledModel("openai", "gpt-4o-mini"), systemPrompt: [], tools: [] },
@@ -116,7 +118,7 @@ describe("AgentSession message pipeline", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: createModelRegistryStub() as never,
-			obfuscator: finalFlush ? new SecretObfuscator([{ type: "plain", content: "test-secret" }]) : undefined,
+			obfuscator,
 			sideStreamFn: () => {
 				const stream = new AssistantMessageEventStream();
 				const message = createAssistantMessage(chunks.join(""));
@@ -128,6 +130,54 @@ describe("AgentSession message pipeline", () => {
 		sessions.push(session);
 		return session;
 	}
+
+	it.each([true, false])(
+		"keeps side-turn results and deltas protected unless explicitly opted out, active=%s",
+		async active => {
+			const secret = "ephemeral-output-credential-849216";
+			const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
+			const placeholder = obfuscator.obfuscate(secret);
+			expect(placeholder).not.toBe(secret);
+			obfuscator.setObfuscating(active);
+			const reply = `Benign answer: ${placeholder}.`;
+			const chunks = ["Benign answer: ", placeholder.slice(0, 3), placeholder.slice(3), "."];
+			const providerMessage = createAssistantMessage(reply);
+			const session = new AgentSession({
+				agent: new Agent({
+					initialState: { model: getBundledModel("openai", "gpt-4o-mini"), systemPrompt: [], tools: [] },
+				}),
+				sessionManager: SessionManager.inMemory(),
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry: createModelRegistryStub() as never,
+				obfuscator,
+				sideStreamFn: () => {
+					const stream = new AssistantMessageEventStream();
+					for (const delta of chunks) {
+						stream.push({ type: "text_delta", contentIndex: 0, delta, partial: providerMessage });
+					}
+					stream.push({ type: "done", reason: "stop", message: providerMessage });
+					return stream;
+				},
+			});
+			sessions.push(session);
+			const deltas: string[] = [];
+			const result = await session.runEphemeralTurn({
+				promptText: "Question?",
+				onTextDelta: delta => {
+					deltas.push(delta);
+				},
+			});
+			const expectedReply = active ? reply : `Benign answer: ${secret}.`;
+			expect(result.replyText).toBe(expectedReply);
+			expect(result.assistantMessage.content).toEqual([{ type: "text", text: expectedReply }]);
+			expect(deltas.join("")).toBe(expectedReply);
+			expect(providerMessage.content).toEqual([{ type: "text", text: reply }]);
+			if (active) {
+				expect(deltas).toEqual(chunks);
+				expect(JSON.stringify({ result, deltas })).not.toContain(secret);
+			}
+		},
+	);
 
 	it.each([false, true])("awaits ordered async delivery, final flush=%s", async finalFlush => {
 		const chunks = ["A", finalFlush ? "$" : "B"];

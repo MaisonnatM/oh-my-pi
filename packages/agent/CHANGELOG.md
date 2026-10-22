@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an optional host tool-output boundary that protects final results, argument event copies, additional context, synthetic errors, and detached publication before retained history. Active boundaries withhold content-bearing partial updates.
+
 ## [18.12.4] - 2026-10-20
 
 ### Fixed

@@ -736,6 +736,7 @@ export async function postProcessToolResult(
 	toolName: string,
 	context?: AgentToolContext,
 ): Promise<AgentToolResult> {
+	result = context?.toolOutputBoundary?.result(result) ?? result;
 	const processed = await spillLargeResultToArtifact(result, toolName, context);
 	const meta: OutputMeta | undefined = processed.details?.meta;
 	return meta ? { ...processed, content: appendOutputNotice(processed.content, meta) } : processed;
@@ -753,6 +754,7 @@ async function wrappedExecute(
 
 	try {
 		let result = await originalExecute.call(this, toolCallId, params, signal, onUpdate, context);
+		result = context?.toolOutputBoundary?.result(result) ?? result;
 
 		// Spill large results to artifact, truncate to tail
 		result = await spillLargeResultToArtifact(result, this.name, context);

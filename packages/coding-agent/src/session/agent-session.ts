@@ -4295,14 +4295,14 @@ export class AgentSession implements SettingsScope {
 				? this.#queueMessageEndPersistence(event.message, eventPromptGeneration)
 				: undefined;
 
-		// Deobfuscate assistant message content for display emission — the LLM echoes back
-		// obfuscated placeholders, but listeners (TUI, extensions, exporters) must see real
-		// values. The original event.message stays obfuscated so the persistence path below
-		// writes `$$HASH$$` tokens to the session file; convertToLlm re-obfuscates outbound
-		// traffic on the next turn. Walks text, thinking, and toolCall arguments/intent.
 		let displayEvent: AgentEvent = event;
 		const obfuscator = this.#obfuscator;
-		if (obfuscator && event.type === "message_end" && event.message.role === "assistant") {
+		if (
+			obfuscator &&
+			!obfuscator.obfuscates() &&
+			event.type === "message_end" &&
+			event.message.role === "assistant"
+		) {
 			const message = event.message;
 			const deobfuscatedContent = deobfuscateAssistantContent(obfuscator, message.content);
 			if (deobfuscatedContent !== message.content) {
@@ -12167,7 +12167,9 @@ export class AgentSession implements SettingsScope {
 				if (event.type === "text_delta") {
 					providerReplyText += event.delta;
 					if (args.onTextDelta) {
-						const readyText = this.#deobfuscatedProviderTextReadyForDelta(providerReplyText);
+						const readyText = this.#obfuscator?.obfuscates()
+							? providerReplyText
+							: this.#deobfuscatedProviderTextReadyForDelta(providerReplyText);
 						if (readyText.length > emittedReplyText.length) {
 							const delta = readyText.slice(emittedReplyText.length);
 							emittedReplyText = readyText;
@@ -12185,9 +12187,10 @@ export class AgentSession implements SettingsScope {
 					// 'H.content.filter')`. Normalize to `[]` so the recap surfaces an empty reply
 					// instead of turning a malformed side-channel response into a session-mute crash.
 					const rawContent = Array.isArray(event.message.content) ? event.message.content : [];
-					assistantMessage = this.#obfuscator?.hasSecrets()
-						? { ...event.message, content: deobfuscateAssistantContent(this.#obfuscator, rawContent) }
-						: { ...event.message, content: rawContent };
+					assistantMessage =
+						this.#obfuscator?.hasSecrets() && !this.#obfuscator.obfuscates()
+							? { ...event.message, content: deobfuscateAssistantContent(this.#obfuscator, rawContent) }
+							: { ...event.message, content: rawContent };
 					break;
 				}
 				if (event.type === "error") {
@@ -12212,7 +12215,9 @@ export class AgentSession implements SettingsScope {
 		if (!assistantMessage) {
 			throw new Error("Ephemeral turn ended without a final message");
 		}
-		const replyText = this.#deobfuscateFromProvider(providerReplyText);
+		const replyText = this.#obfuscator?.obfuscates()
+			? providerReplyText
+			: this.#deobfuscateFromProvider(providerReplyText);
 		if (args.onTextDelta && replyText.length > emittedReplyText.length) {
 			await args.onTextDelta(replyText.slice(emittedReplyText.length));
 		}

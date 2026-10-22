@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added read-only `env://` names and presence inspection without environment values.
+
+### Changed
+
+- Credential protection is enabled by default and masks recognized values in tool-result events and new transcript results, including nested metadata, contextual passwords, authorization values, and connection passwords. Explicit `secrets.enabled: false` opts out of future protection.
+- Protected sessions delay live tool previews and Cursor stdout until safe final output is available. Read, grep, shell, and artifact previews protect text before truncation or omit incomplete context. Public tool-call payloads, assistant events, and ephemeral replies remain masked while execution restores their values. Unresolved generated execution placeholders require a fresh protected source read.
+
 ## [18.12.6] - 2026-10-21
 
 ### Added

@@ -1,6 +1,6 @@
 import { type ElidedRange, formatSingleLine } from "@oh-my-pi/pi-tui/tools/read";
 import * as path from "node:path";
-import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { AgentToolResult, ToolOutputBoundary } from "@oh-my-pi/pi-agent-core";
 import { countNewlines } from "@oh-my-pi/pi-utils";
 import { getEditStore } from "../edit/store";
 import {
@@ -40,6 +40,12 @@ import { cfgReadRenderMarkdown } from "./settings";
 export function toReadTruncationStats(result: TruncationResult): ReadTruncationStats {
 	const { content: _content, ...stats } = result;
 	return stats;
+}
+
+export function protectLines(boundary: ToolOutputBoundary | undefined, lines: string[], sourceText?: string): string[] {
+	if (!boundary?.enabled) return lines;
+	boundary.discover(sourceText ?? lines.join("\n"));
+	return lines.map(line => boundary.text(line));
 }
 
 function prependLineNumbers(text: string, startNum: number): string {
@@ -319,6 +325,10 @@ export async function buildInMemoryTextResult(
 	limit: number | undefined,
 	options: InMemoryTextOptions,
 ): Promise<AgentToolResult<ReadToolDetails>> {
+	const sourceText = text;
+	if (session.toolOutputBoundary?.enabled) {
+		text = protectLines(session.toolOutputBoundary, text.split("\n"), text).join("\n");
+	}
 	const displayMode = resolveFileDisplayMode(session, { raw: options.raw, immutable: options.immutable });
 	const details = options.details ?? {};
 	const rawDisplay = options.raw === true;
@@ -418,7 +428,7 @@ export async function buildInMemoryTextResult(
 					session,
 					options.sourcePath,
 					formatPathRelativeToCwd(options.sourcePath, session.cwd),
-					text,
+					sourceText,
 				)
 			: undefined;
 	let emittedHashlineHeader = false;
@@ -549,6 +559,10 @@ export async function buildInMemoryMultiRangeResult(
 	ranges: readonly LineRange[],
 	options: Omit<InMemoryTextOptions, "ignoreResultLimits">,
 ): Promise<AgentToolResult<ReadToolDetails>> {
+	const sourceText = text;
+	if (session.toolOutputBoundary?.enabled) {
+		text = protectLines(session.toolOutputBoundary, text.split("\n"), text).join("\n");
+	}
 	const displayMode = resolveFileDisplayMode(session, { raw: options.raw, immutable: options.immutable });
 	const details = options.details ?? {};
 	// Raw mode only emits the requested windows, so it never splits the whole text.
@@ -564,7 +578,7 @@ export async function buildInMemoryMultiRangeResult(
 					session,
 					options.sourcePath,
 					formatPathRelativeToCwd(options.sourcePath, session.cwd),
-					text,
+					sourceText,
 				)
 			: undefined;
 	let emittedHashlineHeader = false;

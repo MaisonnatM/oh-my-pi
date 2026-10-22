@@ -3741,11 +3741,11 @@ describe("assistant replay thought signatures", () => {
 		expect(rewrittenPart?.thoughtSignature).not.toBe("c2lnbmVkLW9yaWdpbmFsLWNhbGw=");
 		expect(untouchedPart?.thoughtSignature).toBe("c2lnbmVkLXVudG91Y2hlZC1jYWxs");
 
-		// Restoration still returns the raw argument value; only the signature is
-		// gone, which is exactly what the thinking branch above already does.
-		const restored = deobfuscateAssistantContent(obfuscator, blocks);
-		if (restored[0]?.type !== "toolCall") throw new Error("expected a replayed tool call");
-		expect(restored[0].arguments).toEqual({ command: `deploy --token ${secret}` });
+		const display = deobfuscateAssistantContent(obfuscator, blocks);
+		expect(display).toBe(blocks);
+		expect(deobfuscateToolArguments(obfuscator, rewritten.arguments)).toEqual({
+			command: `deploy --token ${secret}`,
+		});
 
 		// Fixed point: the second obfuscation pass (convertToLlm then
 		// transformProviderContext) rewrites nothing and clears nothing further.
@@ -4329,7 +4329,7 @@ describe("native replay secret obfuscation", () => {
 });
 
 describe("deobfuscateAgentMessages (display restore)", () => {
-	it("restores assistant text and tool calls while leaving raw user text and thinking untouched", () => {
+	it("restores assistant text while leaving public tool calls, raw user text and thinking untouched", () => {
 		const secret = "DISPLAY_SECRET_TOKEN_123";
 		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
 		const placeholder = obfuscator.obfuscate(secret);
@@ -4347,6 +4347,7 @@ describe("deobfuscateAgentMessages (display restore)", () => {
 					name: "read",
 					arguments: { path: `path ${placeholder}` },
 					intent: `intent ${placeholder}`,
+					rawBlock: `raw ${placeholder}`,
 				},
 			],
 			api: "test",
@@ -4379,13 +4380,14 @@ describe("deobfuscateAgentMessages (display restore)", () => {
 
 		const restored = deobfuscateAgentMessages(obfuscator, [userMsg, assistantMsg, branchSummary, compactionSummary]);
 
-		// Assistant text and tool-call args/intent are restored to the real secret.
 		const restoredAssistant = restored[1] as AssistantMessage;
 		const assistantJson = JSON.stringify(restoredAssistant.content);
 		expect(assistantJson).toContain(secret);
 		expect(assistantJson).not.toContain(`answer ${placeholder}`);
-		expect(assistantJson).not.toContain(`path ${placeholder}`);
-		expect(assistantJson).not.toContain(`intent ${placeholder}`);
+		expect(assistantJson).toContain(`path ${placeholder}`);
+		expect(assistantJson).toContain(`intent ${placeholder}`);
+		expect(assistantJson).toContain(`raw ${placeholder}`);
+		expect(restoredAssistant.content[2]).toBe(assistantMsg.content[2]);
 		// Opaque thinking is never walked: placeholder-shaped bytes survive unchanged.
 		expect(assistantJson).toContain(`reason ${placeholder}`);
 		expect(assistantJson).not.toContain(`reason ${secret}`);
@@ -4423,5 +4425,52 @@ describe("deobfuscateAgentMessages (display restore)", () => {
 		expect(text.type === "text" && text.text).toBe(`archived ${secret}`);
 		// ...while the snapcompact image bytes pass through untouched.
 		expect(image.type === "image" && image.data).toBe(imageData);
+	});
+});
+
+describe("credential placeholder execution guard", () => {
+	it("rejects unresolved generated aliases while restoring known aliases and allowing unrelated literals", () => {
+		const key = "synthetic-execution-placeholder-key";
+		const live = new SecretObfuscator(builtinCredentialSecretEntries(), key);
+		const restarted = new SecretObfuscator(builtinCredentialSecretEntries(), key);
+		for (const secret of ["UPPERCASEVALUE", "lowercasevalue", "Capitalizedvalue", "MixedCaseValue", "123456789"]) {
+			const placeholder = live.obfuscateCredentialValue(secret);
+			const bareAlias = placeholder.replace(/^\$\$[A-Z0-9]+_/, () => "$$");
+			const renamedAlias = placeholder.replace(/^\$\$[A-Z0-9]+_/, () => `$$${"A".repeat(40)}_`);
+			for (const alias of [placeholder, bareAlias, renamedAlias]) {
+				expect(deobfuscateToolArguments(live, { value: alias })).toEqual({ value: secret });
+				expect(deobfuscateToolArguments(live, { value: `prefix ${alias} suffix` })).toEqual({
+					value: `prefix ${secret} suffix`,
+				});
+			}
+			for (const alias of [placeholder, bareAlias]) {
+				expect(() => deobfuscateToolArguments(restarted, { value: `$$ABCD$$ prefix ${alias} suffix` })).toThrow(
+					"Re-read its source",
+				);
+			}
+		}
+		for (const literal of ["$$ABCD$$", "$$LABEL_ABCD:M$$", "$$ABCDEFGHIJKLM$$", "$$lowercase123$$"]) {
+			expect(deobfuscateToolArguments(live, { value: literal })).toEqual({ value: literal });
+			expect(deobfuscateToolArguments(restarted, { value: literal })).toEqual({ value: literal });
+		}
+	});
+
+	it("rejects an unresolved collision-retried generated placeholder", () => {
+		const key = "synthetic-colliding-placeholder-key";
+		const secret = "COLLIDINGVALUE";
+		const first = new SecretObfuscator([{ type: "plain", content: secret }], key);
+		const reserved = first.obfuscate(secret);
+		const live = new SecretObfuscator(
+			[
+				{ type: "plain", content: secret },
+				{ type: "plain", content: reserved },
+			],
+			key,
+		);
+		const retried = live.obfuscate(secret);
+		expect(retried).not.toBe(reserved);
+		expect(deobfuscateToolArguments(live, { value: retried })).toEqual({ value: secret });
+		const restarted = new SecretObfuscator(builtinCredentialSecretEntries(), key);
+		expect(() => deobfuscateToolArguments(restarted, { value: retried })).toThrow("Re-read its source");
 	});
 });
