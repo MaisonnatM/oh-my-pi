@@ -2,9 +2,6 @@
 
 ## [Unreleased]
 
-### Changed
-
-- Updated Bun engine requirement to ≥1.4.4
 ### Added
 
 - `tools.xdevNotices: false` hides the `xd://: mounted …` notices shown as MCP servers connect, without turning on `startup.quiet` ([#17263](https://github.com/can1357/oh-my-pi/pull/17263) by [@MaisonnatM](https://github.com/MaisonnatM))
@@ -22,6 +19,9 @@
 - Pasting or dropping an image file into the prompt in a terminal with enhanced paste (Tern, kitty) now attaches the image instead of typing its path
 - The plan review's edit button in Tern names your editor ("Edit in Notepad", "Edit in nvim") instead of "Edit in $EDITOR"
 - Fixed `/tan` clones ending without a final answer when they call `ask`; the clone now keeps running and the parent receives its final answer instead of an empty result ([#17223](https://github.com/can1357/oh-my-pi/pull/17223) by [@trukhinyuri](https://github.com/trukhinyuri))
+### Changed
+
+- Updated Bun engine requirement to ≥1.4.4
 
 ## [18.13.2] - 2026-10-27
 
