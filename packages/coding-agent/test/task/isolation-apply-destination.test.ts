@@ -63,10 +63,25 @@ function createSession(cwd: string, extra: Partial<ToolSession> = {}): ToolSessi
 	} as unknown as ToolSession;
 }
 
-/** The child writes `feature.txt` in the isolated copy it was given. */
+/** The child reports it is running, then writes `feature.txt` in the isolated copy it was given. */
 function childWritesFeatureFile(): void {
 	vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 		if (!options.worktree) throw new Error("isolated child got no worktree");
+		options.onProgress?.({
+			index: 0,
+			id: options.id,
+			agent: options.agent.name,
+			agentSource: "bundled",
+			status: "running",
+			task: "Write the feature.",
+			recentTools: [],
+			recentOutput: [],
+			toolCount: 0,
+			requests: 0,
+			tokens: 0,
+			cost: 0,
+			durationMs: 0,
+		});
 		await Bun.write(path.join(options.worktree, "feature.txt"), "child work\n");
 		return {
 			index: 0,
@@ -107,17 +122,21 @@ describe("isolated apply destination", () => {
 		childWritesFeatureFile();
 
 		const tool = await TaskTool.create(createSession(main));
-		const result = await tool.execute("tc-dest", {
-			agent: "worker",
-			task: "Write the feature.",
-			isolated: true,
-			checkout: worktree,
-		} as TaskParams);
+		const shownDestinations = new Set<string | undefined>();
+		const result = await tool.execute(
+			"tc-dest",
+			{ agent: "worker", task: "Write the feature.", isolated: true, checkout: worktree } as TaskParams,
+			undefined,
+			update => {
+				for (const progress of update.details?.progress ?? []) shownDestinations.add(progress.checkout);
+			},
+		);
 
 		expect(result.isError).not.toBe(true);
 		expect(git(main, "status", "--porcelain")).toBe(mainStatusBefore);
 		expect(await Bun.file(path.join(main, "README.md")).text()).toBe("seed\nconcurrent edit\n");
 		expect(await Bun.file(path.join(worktree, "feature.txt")).text()).toBe("child work\n");
+		expect([...shownDestinations]).toEqual([worktree]);
 	});
 
 	it("leaves the checkout untouched and keeps the patch when an extension refuses the apply", async () => {
@@ -141,7 +160,7 @@ describe("isolated apply destination", () => {
 			isolated: true,
 		} as TaskParams);
 
-		expect(events.map(event => event.checkout)).toEqual([await fs.realpath(main)]);
+		expect(await Promise.all(events.map(event => fs.realpath(event.checkout)))).toEqual([await fs.realpath(main)]);
 		expect(await Bun.file(path.join(main, "feature.txt")).exists()).toBe(false);
 		expect(git(main, "status", "--porcelain")).toBe(mainStatusBefore);
 		const patchPath = result.details?.results[0]?.patchPath;
