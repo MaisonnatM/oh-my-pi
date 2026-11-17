@@ -1,7 +1,6 @@
 {
-  "client_id": "https://cdn.jsdelivr.net/gh/MaisonnatM/oh-my-pi@cimd-probe/assets/oauth/client-metadata.json",
+  "client_id": "https://cdn.jsdelivr.net/gh/MaisonnatM/oh-my-pi@cimd-probe-min/assets/oauth/client-metadata.json",
   "client_name": "oh-my-pi",
-  "client_uri": "https://omp.sh",
   "redirect_uris": [
     "http://localhost/callback",
     "http://127.0.0.1/callback"
@@ -13,6 +12,5 @@
   "response_types": [
     "code"
   ],
-  "token_endpoint_auth_method": "none",
-  "application_type": "native"
+  "token_endpoint_auth_method": "none"
 }
